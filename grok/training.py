@@ -12,13 +12,15 @@ from argparse import ArgumentParser, Namespace
 from functools import reduce
 from typing import Any, Dict, List, Optional, Tuple, Union
 import time
+from collections import namedtuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -30,7 +32,7 @@ from grok.data import (
     ArithmeticDataset,
     ArithmeticIterator,
 )
-from grok.transformer import Transformer
+from grok.transformer import Transformer, ExitTransformer
 from grok.measure import get_sharpness
 
 DEFAULT_LOG_DIR = "logs"
@@ -47,10 +49,16 @@ class TrainableTransformer(LightningModule):
                         self.add_model_specific_args().
         """
         super().__init__()
-        self.hparams = hparams  # type: ignore
+        # hparams = vars(hparams)
+        # print("hparams", hparams)
+        for key in vars(hparams).keys():
+            self.hparams[key] = vars(hparams)[key]
+        # self.hparams = hparams
+        # self.save_hyperparameters(hparams)
+        # self.hparams.update(hparams)  # type: ignore
         self.prepare_data()
 
-        self.transformer = Transformer(
+        self.transformer = ExitTransformer(
             hparams.n_layers,
             hparams.n_heads,
             hparams.d_model,
@@ -266,6 +274,75 @@ class TrainableTransformer(LightningModule):
         accuracy = row_accuracy.float() * 100  # shape: batchsize
         return accuracy
 
+    def _agreement(
+        self,
+        y_hat_exits: torch.Tensor,
+        y_hat: torch.Tensor,
+        y: torch.Tensor = None,
+    ) -> torch.Tensor:
+        # Get token predictions from output logits
+        # (num_exits, batch_size, vocab_size, seq_len) -> (num_exits, batch_size, seq_len)
+        y_hat_exits = torch.argmax(y_hat_exits, dim=-2)
+        # (batch_size, vocab_size, seq_len) -> (batch_size, seq_len)
+        y_hat = torch.argmax(y_hat, dim=-2)
+
+        # Append final prediction to exit predictions to make it look like another exit layer
+        # (num_exits, batch_size, seq_len) -> (num_exits + 1, batch_size, seq_len)
+        y_hat_exits = torch.cat([y_hat_exits, y_hat.unsqueeze(0)], dim=0)
+
+        # If true labels are provided, use those for comparison instead
+        y_hat = y_hat if y is None else y
+
+        # Generate table where each column is a list with boolean values indicating whether
+        # the exit at that index agrees with the final prediction for all tokens in the sequence
+        # ((batch_size, seq_len), (num_exits + 1, batch_size, seq_len)) -> (num_exits + 1, batch_size)
+        layerwise_agreements = torch.min(y_hat == y_hat_exits, dim=-1).values
+
+        # Reverse the order of the layers and transpose the table so that each row is an agreement list
+        # (num_exits + 1, batch_size) -> (batch_size, reversed(num_exits + 1))
+        layerwise_agreements = layerwise_agreements.flip(0).T
+
+        # Find the index of the first exit layer in the reversed layerwise agreement list
+        # that disagrees with the final prediction
+        first_agree_layer = torch.min(layerwise_agreements, dim=-1).indices
+
+        # Reverse the index to get the index of the first exit layer in the original layerwise agreement list
+        minimum_exit_depth = layerwise_agreements.shape[1] - first_agree_layer
+
+        # Since some sequences may not have any disagreement, we need to replace those entries with 0s
+        minimum_exit_depth[torch.min(layerwise_agreements, dim=-1).values] = 0
+        return minimum_exit_depth  # (batch_size,)
+
+    def _consistency(
+        self,
+        y_hat_exits: torch.Tensor,
+        y_hat: torch.Tensor,
+        y: torch.Tensor = None,
+    ) -> torch.Tensor:
+        # Get token predictions from output logits
+        # (num_exits, batch_size, vocab_size, seq_len) -> (num_exits, batch_size, seq_len)
+        y_hat_exits = torch.argmax(y_hat_exits, dim=-2)
+        # (batch_size, vocab_size, seq_len) -> (batch_size, seq_len)
+        y_hat = torch.argmax(y_hat, dim=-2)
+
+        # Append final prediction to exit predictions to make it look like another exit layer
+        # (num_exits, batch_size, seq_len) -> (num_exits + 1, batch_size, seq_len)
+        # y_hat_exits = torch.cat([y_hat_exits, y_hat.unsqueeze(0)], dim=0)
+
+        # If true labels are provided, use those for comparison instead
+        y_hat = y_hat if y is None else y
+
+        # Generate table where each column is a list with boolean values indicating whether
+        # the exit at that index agrees with the final prediction for all tokens in the sequence
+        # ((batch_size, seq_len), (num_exits + 1, batch_size, seq_len)) -> (num_exits + 1, batch_size)
+        layerwise_agreements = torch.min(y_hat == y_hat_exits, dim=-1).values
+
+        # Reverse the order of the layers and transpose the table so that each row is an agreement list
+        # (num_exits + 1, batch_size) -> (batch_size, reversed(num_exits + 1))
+        layerwise_agreements = layerwise_agreements.flip(0).T
+
+        return layerwise_agreements.sum(dim=1)  # (batch_size,)
+
     def _step(
         self,
         batch: Dict,
@@ -291,7 +368,7 @@ class TrainableTransformer(LightningModule):
         """
         x = batch["text"]  # shape = batchsize * context_len
         y = batch["target"]  # shape = batchsize * context_len
-        y_hat, attentions, values = self(
+        y_hat, y_hat_exits, attentions, values = self(
             x=x, save_activations=self.hparams.save_activations  # type: ignore
         )  # shape = batchsize * context_len * vocab_size
         y_hat = y_hat.transpose(-2, -1)  # shape = batchsize * vocab_size * context_len
@@ -317,6 +394,61 @@ class TrainableTransformer(LightningModule):
             acc = self._accuracy(y_hat_rhs, y_rhs)
             if reduction == "mean":
                 acc = acc.mean()
+
+        # Multi-exit loss
+        y_hat_exits = torch.stack(y_hat_exits, dim=0).transpose(-2, -1)
+        y_hat_rhs_exits = y_hat_exits[..., eq_position + 1 :]
+        # loss_exits = F.cross_entropy(y_hat_rhs_exits, y_rhs, reduction=reduction)
+        loss_exits = [
+            F.cross_entropy(y_hat_rhs_exit, y_rhs, reduction=reduction)
+            for y_hat_rhs_exit in y_hat_rhs_exits
+        ]
+        loss_exits = torch.stack(loss_exits)
+        loss_exits = torch.sum(loss_exits)
+        loss = loss + loss_exits
+
+        acc_exits = []
+        for y_hat_rhs_exit in y_hat_rhs_exits:
+            with torch.no_grad():
+                acc_exit = self._accuracy(y_hat_rhs_exit, y_rhs)
+                if reduction == "mean":
+                    acc_exit = acc_exit.mean()
+                acc_exits.append(acc_exit)
+
+        # Multi-exit metrics
+        agreement = self._agreement(y_hat_rhs_exits, y_hat_rhs)
+        consistency = self._consistency(y_hat_rhs_exits, y_hat_rhs)
+        tp_agreement = self._agreement(y_hat_rhs_exits, y_hat_rhs, y_rhs)
+        tp_consistency = self._consistency(y_hat_rhs_exits, y_hat_rhs, y_rhs)
+        agreement_mean = agreement.float().mean().item()
+        consistency_mean = consistency.float().mean().item()
+        tp_agreement_mean = tp_agreement.float().mean().item()
+        tp_consistency_mean = tp_consistency.float().mean().item()
+        ExitMetrics = namedtuple(
+            "ExitMetrics",
+            [
+                "agreement",
+                "consistency",
+                "tp_agreement",
+                "tp_consistency",
+                "agreement_mean",
+                "consistency_mean",
+                "tp_agreement_mean",
+                "tp_consistency_mean",
+            ],
+        )
+        exit_metrics = ExitMetrics(
+            agreement,
+            consistency,
+            tp_agreement,
+            tp_consistency,
+            agreement_mean,
+            consistency_mean,
+            tp_agreement_mean,
+            tp_consistency_mean,
+        )
+
+        # Back to the old code
 
         """
         device = self.transformer.embedding.weight.device
@@ -353,8 +485,17 @@ class TrainableTransformer(LightningModule):
                 else:
                     grad_vec = torch.cat((grad_vec, p.grad.data.view(-1)))
             return loss, grad_vec
-        return loss, acc, coeff, x_lhs, y_hat_rhs, attentions, values
-
+        return (
+            loss,
+            acc,
+            acc_exits,
+            exit_metrics,
+            coeff,
+            x_lhs,
+            y_hat_rhs,
+            attentions,
+            values,
+        )
 
     def _save_inputs(self, outputs: Dict, ds: str) -> None:
         """
@@ -445,9 +586,17 @@ class TrainableTransformer(LightningModule):
             self.fwd_time_in_epoch = 0
 
         start = time.time()
-        loss, accuracy, coeff, x_lhs, y_hat_rhs, attentions, values = self._step(
-            batch=batch, batch_idx=batch_idx, train=True
-        )
+        (
+            loss,
+            accuracy,
+            accuracy_exits,
+            exit_metrics,
+            coeff,
+            x_lhs,
+            y_hat_rhs,
+            attentions,
+            values,
+        ) = self._step(batch=batch, batch_idx=batch_idx, train=True)
         self.fwd_time_in_epoch += time.time() - start
 
         schedulers = self.trainer.lr_schedulers[0]
@@ -458,6 +607,8 @@ class TrainableTransformer(LightningModule):
             "loss": loss,
             "partial_train_loss": coeff * loss,
             "partial_train_accuracy": coeff * accuracy,
+            "partial_train_accuracy_exits": [coeff * a for a in accuracy_exits],
+            "partial_train_exit_metrics": exit_metrics,
             "learning_rate": torch.tensor([lr]),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
@@ -519,6 +670,57 @@ class TrainableTransformer(LightningModule):
             for k, v in logs.items():
                 self.log(k, v)
 
+            # Multi-exit accuracy
+            for i in range(len((outputs[0]["partial_train_accuracy_exits"]))):
+                train_accuracy_exit = torch.stack(
+                    [x["partial_train_accuracy_exits"][i] for x in outputs]
+                ).sum()
+                self.log(f"train/accuracy_exit_{i}", train_accuracy_exit)
+
+            # Exit metrics
+            all_exit_metrics = [o["partial_train_exit_metrics"] for o in outputs]
+            self.log(
+                "train/agreement",
+                wandb.Histogram(
+                    torch.cat([x.agreement for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "train/consistency",
+                wandb.Histogram(
+                    torch.cat([x.consistency for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "train/tp_agreement",
+                wandb.Histogram(
+                    torch.cat([x.tp_agreement for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "train/tp_consistency",
+                wandb.Histogram(
+                    torch.cat([x.tp_consistency for x in all_exit_metrics]).tolist()
+                ),
+            )
+
+            self.log(
+                "train/agrement_mean",
+                torch.cat([x.agreement for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "train/consistency_mean",
+                torch.cat([x.consistency for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "train/tp_agreement_mean",
+                torch.cat([x.tp_agreement for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "train/tp_consistency_mean",
+                torch.cat([x.tp_consistency for x in all_exit_metrics]).float().mean(),
+            )
+
     def validation_step(self, batch, batch_idx):
         """
         Used by pytorch_lightning
@@ -534,12 +736,22 @@ class TrainableTransformer(LightningModule):
         if self.current_epoch != self.next_epoch_to_eval:
             return {}
         with torch.no_grad():
-            loss, accuracy, coeff, x_lhs, y_hat_rhs, attentions, values = self._step(
-                batch=batch, batch_idx=batch_idx, train=False
-            )
+            (
+                loss,
+                accuracy,
+                accuracy_exits,
+                exit_metrics,
+                coeff,
+                x_lhs,
+                y_hat_rhs,
+                attentions,
+                values,
+            ) = self._step(batch=batch, batch_idx=batch_idx, train=False)
         output = {
             "partial_val_loss": coeff * loss,
             "partial_val_accuracy": coeff * accuracy,
+            "partial_val_accuracy_exits": [coeff * a for a in accuracy_exits],
+            "partial_val_exit_metrics": exit_metrics,
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -592,12 +804,66 @@ class TrainableTransformer(LightningModule):
             train_data = self.train_dataset.data.to(device)
             training_data = {"text": train_data[:, :-1], "target": train_data[:, 1:]}
             with torch.no_grad():
-                tr_loss, tr_acc, *_ = self._step(training_data, 0)
+                tr_loss, tr_acc, tr_acc_ex, *_ = self._step(training_data, 0)
                 logs["full_train_loss"] = tr_loss
                 logs["full_train_acc"] = tr_acc
+                for i, v in enumerate(tr_acc_ex):
+                    logs[f"full_train_acc_{i}"] = v
 
             for k, v in logs.items():
                 self.log(k, v)
+
+            # Multi-exit accuracy
+            for i in range(len((outputs[0]["partial_val_accuracy_exits"]))):
+                val_accuracy_exit = torch.stack(
+                    [x["partial_val_accuracy_exits"][i] for x in outputs]
+                ).sum()
+                self.log(f"val/accuracy_exit_{i}", val_accuracy_exit)
+
+            # Exit metrics
+            all_exit_metrics = [o["partial_val_exit_metrics"] for o in outputs]
+            self.log(
+                "val/agrement",
+                wandb.Histogram(
+                    torch.cat([x.agreement for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "val/consistency",
+                wandb.Histogram(
+                    torch.cat([x.consistency for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "val/tp_agreement",
+                wandb.Histogram(
+                    torch.cat([x.tp_agreement for x in all_exit_metrics]).tolist()
+                ),
+            )
+            self.log(
+                "val/tp_consistency",
+                wandb.Histogram(
+                    torch.cat([x.tp_consistency for x in all_exit_metrics]).tolist()
+                ),
+            )
+
+            self.log(
+                "val/agrement_mean",
+                torch.cat([x.agreement for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "val/consistency_mean",
+                torch.cat([x.consistency for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "val/tp_agreement_mean",
+                torch.cat([x.tp_agreement for x in all_exit_metrics]).float().mean(),
+            )
+            self.log(
+                "val/tp_consistency_mean",
+                torch.cat([x.tp_consistency for x in all_exit_metrics]).float().mean(),
+            )
+
         # save a checkpoint if the epoch is a power of 2
         if (
             self.current_epoch > 0
@@ -624,12 +890,21 @@ class TrainableTransformer(LightningModule):
                   attentions, and values
         """
 
-        loss, accuracy, coeff, x_lhs, y_hat_rhs, attentions, values = self._step(
-            batch=batch, batch_idx=batch_idx, train=False, reduction="none"
-        )
+        (
+            loss,
+            accuracy,
+            accuracy_exits,
+            exit_metrics,
+            coeff,
+            x_lhs,
+            y_hat_rhs,
+            attentions,
+            values,
+        ) = self._step(batch=batch, batch_idx=batch_idx, train=False, reduction="none")
         output = {
             "partial_test_loss": coeff * loss,
             "partial_test_accuracy": coeff * accuracy,
+            "partial_test_accuracy_exits": [coeff * a for a in accuracy_exits],
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -704,7 +979,10 @@ def train(hparams: Namespace) -> None:
 
     torch.save(model, os.path.join(checkpoint_path, "init.pt"))
 
-    logger = CSVLogger(hparams.logdir)
+    # logger = CSVLogger(hparams.logdir)
+    logger = WandbLogger(
+        entity="landskape", project="multi-exit-grok", save_dir=hparams.logdir
+    )
 
     # checkpointer = ModelCheckpoint(
     #     filepath=checkpoint_path,
@@ -723,7 +1001,7 @@ def train(hparams: Namespace) -> None:
         # "checkpoint_callback": checkpointer,
         "logger": logger,
         "log_every_n_steps": 1,
-        "flush_logs_every_n_steps": 1000,
+        # "flush_logs_every_n_steps": 1000,
     }
     if torch.cuda.is_available() and hparams.gpu >= 0:
         trainer_args["gpus"] = [hparams.gpu]
@@ -793,7 +1071,6 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
 
     logger = CSVLogger(hparams.logdir)
 
-
     trainer_args = {
         "max_steps": hparams.max_steps,
         "min_steps": hparams.max_steps,
@@ -803,7 +1080,7 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
         # "checkpoint_callback": checkpointer,
         "logger": logger,
         "log_every_n_steps": 1,
-        "flush_logs_every_n_steps": 1000,
+        # "flush_logs_every_n_steps": 1000,
     }
     if torch.cuda.is_available() and hparams.gpu >= 0:
         trainer_args["gpus"] = [hparams.gpu]

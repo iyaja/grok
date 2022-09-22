@@ -21,18 +21,23 @@ class Linear(nn.Linear):
 
     def forward(self, input: Tensor) -> Tensor:
         if self.weight_noise > 0 and self.training:
-            bias = self.bias if self.bias is None else self.bias + torch.randn_like(self.bias) * self.weight_noise
+            bias = (
+                self.bias
+                if self.bias is None
+                else self.bias + torch.randn_like(self.bias) * self.weight_noise
+            )
             weight = self.weight + torch.randn_like(self.weight) * self.weight_noise
             # weight = self.weight * torch.exp(torch.randn_like(self.weight) * self.weight_noise)
         else:
             bias = self.bias
             weight = self.weight
-            
+
         return F.linear(
             input,
             weight,
             bias,
         )
+
 
 class LayerNorm(nn.LayerNorm):
     def __init__(self, *args, **kwargs):
@@ -41,7 +46,11 @@ class LayerNorm(nn.LayerNorm):
 
     def forward(self, input: Tensor) -> Tensor:
         if self.weight_noise > 0 and self.training:
-            bias = self.bias if self.bias is None else self.bias + torch.randn_like(self.bias) * self.weight_noise
+            bias = (
+                self.bias
+                if self.bias is None
+                else self.bias + torch.randn_like(self.bias) * self.weight_noise
+            )
             weight = self.weight + torch.randn_like(self.weight) * self.weight_noise
             # weight = self.weight * torch.exp(torch.randn_like(self.weight) * self.weight_noise)
         else:
@@ -277,6 +286,49 @@ class Decoder(nn.Module):
         return a, attentions, values
 
 
+class ExitDecoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        heads: int,
+        num_blocks: int,
+        dropout: float,
+        non_linearity: str = "relu",
+        weight_noise: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    d_model, heads, dropout, non_linearity, weight_noise=weight_noise
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        self_attn_mask: Tensor = None,
+        save_activations=False,
+    ) -> Tuple[Tensor, List[List[Tensor]], List[List[Tensor]]]:
+
+        a = x
+        activations = []
+        attentions = []
+        values = []
+        for block in self.blocks:
+            a, layer_attentions, layer_values = block(
+                a, self_attn_mask, save_activations=save_activations
+            )
+            activations.append(a)
+            if save_activations:
+                attentions.append(layer_attentions)
+                values.append(layer_values)
+        return activations, attentions, values
+
+
 class Transformer(nn.Module):
     def __init__(
         self,
@@ -377,3 +429,114 @@ class Transformer(nn.Module):
 
         y_hat = self.linear(decoded)
         return y_hat, attentions, values
+
+
+class ExitTransformer(nn.Module):
+    def __init__(
+        self,
+        n_layers: int = 4,
+        n_heads: int = 4,
+        # n_exits: int = 4,
+        d_model: int = 256,
+        dropout: float = 0.1,
+        max_context_len: int = 1024,
+        vocab_len: int = 2000,
+        non_linearity: str = "relu",
+        weight_noise: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.dropout = dropout
+        self.max_context_len = max_context_len
+        self.non_linearity = non_linearity
+
+        self.vocab_len = vocab_len
+
+        self.embedding = Embedding(vocab_len, d_model, weight_noise=weight_noise)  # type: ignore
+        self.register_buffer(
+            "position_encoding", self._position_encoding(max_context_len, d_model)
+        )
+        self.register_buffer("self_attn_mask", self.make_mask(max_context_len))
+
+        self.decoder = ExitDecoder(
+            d_model,
+            n_heads,
+            n_layers,
+            dropout,
+            self.non_linearity,
+            weight_noise=weight_noise,
+        )
+
+        self.linear = Linear(d_model, vocab_len, bias=False, weight_noise=weight_noise)
+        self.exits = nn.ModuleList(
+            [
+                Linear(d_model, vocab_len, bias=False, weight_noise=weight_noise)
+                for _ in range(n_layers)
+            ]
+        )
+
+    @staticmethod
+    def make_mask(context_len: int) -> Tensor:
+        return torch.ones([context_len, context_len]).tril()
+
+    @classmethod
+    def _position_encoding(cls, context_len: int, d_model: int) -> Tensor:
+        rows = [
+            tensor(
+                [
+                    sin(pos / (10000 ** (i / d_model)))
+                    if i % 2 == 0
+                    else cos(pos / (10000 ** ((i - 1) / d_model)))
+                    for i in range(d_model)
+                ]
+            )
+            for pos in range(context_len)
+        ]
+        stack = torch.stack(rows, dim=1)
+
+        return stack.T  # type: ignore
+
+    def embed(self, indices: Tensor) -> Tensor:
+        context_len = indices.shape[-1]
+        pe = self.position_encoding[:context_len, :]  # type: ignore
+
+        embedded = self.embedding(indices)
+
+        return pe + embedded
+
+    def forward(
+        self,
+        x: Tensor,
+        pos: int = None,
+        save_activations: bool = False,
+    ) -> Tuple[Tensor, Union[Tensor, None], Union[Tensor, None]]:
+        """parameters:
+        x:  (rank-1 tensor) vocab indices of decoder input token
+                     sequence"""
+
+        # Make sure sampling inputs are on the correct device
+        x = x.to(self.embedding.weight.device)
+
+        # make_attention mask
+        this_max_context_len = x.shape[-1]
+        self_attn_mask = self.self_attn_mask[  # type: ignore
+            :this_max_context_len, :this_max_context_len
+        ]
+
+        # Decode
+        x = self.embed(x)
+        decoded, attentions, values = self.decoder(
+            x, self_attn_mask, save_activations=save_activations
+        )
+
+        # Return predictions for specific token
+        if pos is not None:
+            decoded = decoded[:, pos, :]
+
+        y_hat = self.linear(decoded[-1])
+        y_hat_exits = [e(decoded[i]) for i, e in enumerate(self.exits)]
+
+        return y_hat, y_hat_exits, attentions, values

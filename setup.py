@@ -5,7 +5,8 @@ setup(
     packages=find_packages(),
     version="0.0.1",
     install_requires=[
-        "pytorch_lightning",
+        "pytorch_lightning==1.2.9",
+        "wandb",
         "blobfile",
         "numpy",
         "torch",
