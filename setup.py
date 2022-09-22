@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "pytorch_lightning==1.2.9",
         "wandb",
+        "sympy",
         "blobfile",
         "numpy",
         "torch",
